@@ -4,28 +4,42 @@ package main
 import (
   "bufio"
   "fmt"
+  "io"
   "net"
   "os"
   "os/signal"
+  "strconv"
 )
 
 func main() {
 
   fmt.Println("Received arguments", os.Args)
 
-  go server()
+  out := make(chan string)
 
-  go client(os.Args[1])
+  go server(out, os.Args[1])
+
+  go client(out, os.Args[2])
 
   interruptSignal := make(chan os.Signal)
   signal.Notify(interruptSignal, os.Interrupt)
-  <-interruptSignal
-  fmt.Println("Ending...")
+
+  defer fmt.Println("Ending...")
+
+  for {
+    select {
+      case <-interruptSignal:
+        return
+      case s := <-out:
+        fmt.Print(s)
+    }
+  }
 }
 
-func server() {
+func server(out chan string, listenPort string) {
 
-  addr := net.TCPAddr{Port: 28216}
+  port, _ := strconv.Atoi(listenPort)
+  addr := net.TCPAddr{IP: net.IP{127, 0, 0, 1}, Port: port}
   listener, err := net.ListenTCP("tcp", &addr)
 
   if err == nil {
@@ -36,9 +50,13 @@ func server() {
 
       conn, err := listener.AcceptTCP()
 
-      if err != nil {
+      if err == nil {
 
-        go incomingHandler(conn)
+        go incomingHandler(out, conn)
+
+      } else {
+
+        out <- fmt.Sprintf("Some error\n(%v)\n", err)
 
       }
 
@@ -48,30 +66,33 @@ func server() {
 
 }
 
-func incomingHandler(conn *net.TCPConn) {
+func incomingHandler(out chan string, conn *net.TCPConn) {
 
   defer conn.Close()
 
-  in := make([]byte, 8)
+  reader := bufio.NewReader(conn)
 
   sender := conn.RemoteAddr().String()
 
   for {
 
-    n, err := conn.Read(in)
+    msg, err := reader.ReadString('\n')
 
-    if err != nil { return }
-
-    msg := string(in[:n])
+    if err != nil {
+      if err != io.EOF {
+        out <- fmt.Sprintf("Error reading input\n(%v)\n", err)
+      }
+      return
+    }
 
     // TODO get a timestamp
-    fmt.Println(sender, msg)
+    out <- fmt.Sprintf("%v: %v", sender, msg)
 
   }
 
 }
 
-func client(host string) {
+func client(out chan string, host string) {
 
   reader := bufio.NewReader(os.Stdin)
 
@@ -81,11 +102,41 @@ func client(host string) {
 
     if err != nil { return }
 
-    fmt.Println("You", ":", msg)
-
-    // TODO send the string
+    sendMessage(out, host, msg)
 
   }
 
+}
+
+func sendMessage(out chan string, host, msg string) {
+
+  addr, err := net.ResolveTCPAddr("tcp", host)
+
+  if err != nil {
+    out <- fmt.Sprintf("Unable to resolve host: %v\n(%v)\n", host, err)
+    return
+  }
+
+  conn, err := net.DialTCP("tcp", nil, addr)
+
+  if err != nil {
+    out <- fmt.Sprintf("Unabled to connect to host: %v\n(%v)\n", host, err)
+    return
+  }
+
+  conn.SetKeepAlive(false)
+  defer func() {
+    err := conn.Close()
+    if err != nil {
+      out <- fmt.Sprintf("Error closing socket\n(%v)\n", err)
+    }
+  }()
+
+  n, err := conn.Write([]byte(msg))
+
+  if err != nil {
+    out <- fmt.Sprintf("Failed to write message to server. Wrote %v\n(%v)\n", n, err)
+    return
+  }
 }
 
